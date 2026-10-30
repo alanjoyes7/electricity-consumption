@@ -1,4 +1,7 @@
 from pathlib import Path
+import urllib.request
+import zipfile
+import shutil
 
 import numpy as np
 import pandas as pd
@@ -13,17 +16,23 @@ from sklearn.metrics import (
 from sklearn.preprocessing import StandardScaler
 
 
+# =========================================================
+# 1. PATH CONFIGURATION
+# =========================================================
+
 BASE_DIR = Path(__file__).resolve().parent
-
-DATA_PATH = (
-    BASE_DIR
-    / "data"
-    / "household_power_consumption.txt"
-)
-
+DATA_DIR = BASE_DIR / "data"
 OUTPUT_DIR = BASE_DIR / "outputs"
+
+DATA_PATH = DATA_DIR / "household_power_consumption.txt"
+ZIP_PATH = DATA_DIR / "household_power_consumption.zip"
+
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+
+# =========================================================
+# 2. FEATURE SELECTION
+# =========================================================
 
 FEATURES = [
     "Global_active_power",
@@ -36,19 +45,102 @@ FEATURES = [
 ]
 
 
-def load_data(sample_size=50000):
-    """Load electricity consumption measurements."""
+# =========================================================
+# 3. AUTOMATIC DATASET DOWNLOAD
+# =========================================================
 
-    if not DATA_PATH.exists():
-        raise FileNotFoundError(
-            f"Dataset not found: {DATA_PATH}"
+def ensure_dataset():
+    """
+    Use the local dataset if available.
+    Otherwise, download and extract it from UCI.
+    """
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Reuse an existing non-empty dataset.
+    if DATA_PATH.exists() and DATA_PATH.stat().st_size > 0:
+        print("Using existing electricity consumption dataset.")
+        return DATA_PATH
+
+    url = (
+        "https://archive.ics.uci.edu/static/public/235/"
+        "individual+household+electric+power+consumption.zip"
+    )
+
+    try:
+        print("Downloading electricity consumption dataset...")
+
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"}
         )
 
-    if DATA_PATH.stat().st_size == 0:
-        raise ValueError("Dataset file is empty.")
+        with urllib.request.urlopen(request, timeout=120) as response:
+            with open(ZIP_PATH, "wb") as destination:
+                shutil.copyfileobj(response, destination)
+
+        # Validate the downloaded archive.
+        if not zipfile.is_zipfile(ZIP_PATH):
+            raise ValueError(
+                "Downloaded file is not a valid ZIP archive."
+            )
+
+        with zipfile.ZipFile(ZIP_PATH, "r") as archive:
+
+            filename = next(
+                (
+                    name for name in archive.namelist()
+                    if name.endswith(
+                        "household_power_consumption.txt"
+                    )
+                ),
+                None
+            )
+
+            if filename is None:
+                raise FileNotFoundError(
+                    "Dataset text file was not found inside the ZIP."
+                )
+
+            # Extract only the required dataset.
+            with archive.open(filename) as source:
+                with open(DATA_PATH, "wb") as destination:
+                    shutil.copyfileobj(source, destination)
+
+        if DATA_PATH.stat().st_size == 0:
+            DATA_PATH.unlink(missing_ok=True)
+            raise ValueError("The extracted dataset is empty.")
+
+        print("Dataset downloaded and extracted successfully.")
+
+        return DATA_PATH
+
+    except Exception as error:
+        DATA_PATH.unlink(missing_ok=True)
+
+        raise RuntimeError(
+            "Unable to download the electricity consumption dataset. "
+            f"Reason: {error}"
+        ) from error
+
+    finally:
+        ZIP_PATH.unlink(missing_ok=True)
+
+
+# =========================================================
+# 4. LOAD DATA
+# =========================================================
+
+def load_data(sample_size=50000):
+    """
+    Load electricity consumption records.
+    Downloads the dataset automatically if it is missing.
+    """
+
+    data_path = ensure_dataset()
 
     df = pd.read_csv(
-        DATA_PATH,
+        data_path,
         sep=";",
         na_values=["?"],
         nrows=sample_size,
@@ -57,27 +149,45 @@ def load_data(sample_size=50000):
 
     if df.empty:
         raise ValueError(
-            "No records found. Check the dataset contents."
+            "No records were loaded. Check the dataset file."
         )
+
+    missing_columns = [
+        column for column in FEATURES
+        if column not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            f"Dataset is missing required columns: {missing_columns}"
+        )
+
+    print(f"Loaded {len(df):,} records.")
 
     return df
 
 
+# =========================================================
+# 5. DATA CLEANING
+# =========================================================
+
 def clean_data(df):
-    """Clean invalid values and duplicate records."""
+    """Remove duplicates and invalid electricity measurements."""
 
     data = df.copy()
-
     original_rows = len(data)
 
+    # Remove duplicate records.
     data = data.drop_duplicates().copy()
 
+    # Convert selected features to numeric values.
     for column in FEATURES:
         data[column] = pd.to_numeric(
             data[column],
             errors="coerce"
         )
 
+    # Replace infinite values with missing values.
     data[FEATURES] = data[FEATURES].replace(
         [np.inf, -np.inf],
         np.nan
@@ -86,7 +196,8 @@ def clean_data(df):
     # Remove records missing essential measurements.
     data = data.dropna(subset=FEATURES).copy()
 
-    # Remove invalid negative measurements.
+    # Electricity consumption and sub-meter readings
+    # should not contain negative values.
     nonnegative_features = [
         "Global_active_power",
         "Global_reactive_power",
@@ -99,9 +210,10 @@ def clean_data(df):
     for column in nonnegative_features:
         data = data[data[column] >= 0]
 
+    # Voltage must be positive.
     data = data[data["Voltage"] > 0].copy()
 
-    report = {
+    cleaning_report = {
         "original_rows": original_rows,
         "cleaned_rows": len(data),
         "removed_rows": original_rows - len(data)
@@ -109,14 +221,22 @@ def clean_data(df):
 
     if len(data) < 10:
         raise ValueError(
-            "Too few records remain after cleaning."
+            "Too few records remain after data cleaning."
         )
 
-    return data, report
+    print("Data cleaning completed.")
 
+    return data, cleaning_report
+
+
+# =========================================================
+# 6. DATA PREPROCESSING
+# =========================================================
 
 def preprocess_data(data):
-    """Impute missing values and standardize features."""
+    """
+    Select features, impute missing values and standardize.
+    """
 
     X = data[FEATURES].copy()
 
@@ -129,8 +249,14 @@ def preprocess_data(data):
     return X_imputed, X_scaled
 
 
+# =========================================================
+# 7. CLUSTER EVALUATION
+# =========================================================
+
 def evaluate_clusters(X_scaled):
-    """Evaluate K-Means for K values from 2 to 6."""
+    """
+    Evaluate K-Means for K values from 2 to 6.
+    """
 
     evaluation_results = []
 
@@ -168,27 +294,35 @@ def evaluate_clusters(X_scaled):
     return pd.DataFrame(evaluation_results)
 
 
-def run_pipeline(sample_size=50000, selected_k=3):
-    """Execute the complete KDD workflow."""
+# =========================================================
+# 8. COMPLETE KDD PIPELINE
+# =========================================================
 
-    # 1. Load data.
+def run_pipeline(sample_size=50000, selected_k=3):
+    """
+    Execute the complete Knowledge Discovery in Databases
+    workflow for electricity consumption clustering.
+    """
+
+    # Step 1: Data collection and loading.
     raw_data = load_data(sample_size)
 
-    # 2. Clean data.
+    # Step 2: Data cleaning.
     cleaned_data, cleaning_report = clean_data(raw_data)
 
-    # 3. Preprocess data.
+    # Step 3: Feature selection and preprocessing.
     _, X_scaled = preprocess_data(cleaned_data)
 
-    # 4. Evaluate different cluster counts.
+    # Step 4: Evaluate different numbers of clusters.
     evaluation = evaluate_clusters(X_scaled)
 
     if selected_k not in evaluation["K"].tolist():
         raise ValueError(
-            f"Choose K from {evaluation['K'].tolist()}"
+            f"Invalid K={selected_k}. "
+            f"Available values: {evaluation['K'].tolist()}"
         )
 
-    # 5. Train final K-Means model.
+    # Step 5: Train the final K-Means model.
     model = KMeans(
         n_clusters=selected_k,
         random_state=42,
@@ -197,7 +331,7 @@ def run_pipeline(sample_size=50000, selected_k=3):
 
     labels = model.fit_predict(X_scaled)
 
-    # 6. Evaluate final model.
+    # Step 6: Evaluate the final clustering.
     metrics = {
         "K": selected_k,
         "Silhouette Score": silhouette_score(
@@ -213,8 +347,9 @@ def run_pipeline(sample_size=50000, selected_k=3):
         "Inertia": model.inertia_
     }
 
-    # 7. Prepare visualization coordinates.
+    # Step 7: Reduce dimensions for visualization.
     pca = PCA(n_components=2)
+
     coordinates = pca.fit_transform(X_scaled)
 
     results = cleaned_data.copy()
@@ -223,7 +358,7 @@ def run_pipeline(sample_size=50000, selected_k=3):
     results["PCA1"] = coordinates[:, 0]
     results["PCA2"] = coordinates[:, 1]
 
-    # 8. Save output files.
+    # Step 8: Save processed results.
     cleaned_data.to_csv(
         OUTPUT_DIR / "cleaned_data.csv",
         index=False
@@ -239,6 +374,9 @@ def run_pipeline(sample_size=50000, selected_k=3):
         index=False
     )
 
+    print("KDD pipeline completed successfully.")
+
+    # Step 9: Return results to the dashboard.
     return {
         "raw_data": raw_data,
         "cleaned_data": cleaned_data,
@@ -247,9 +385,15 @@ def run_pipeline(sample_size=50000, selected_k=3):
         "cleaning_report": cleaning_report,
         "metrics": metrics,
         "features": FEATURES,
-        "explained_variance": pca.explained_variance_ratio_.sum()
+        "explained_variance": (
+            pca.explained_variance_ratio_.sum()
+        )
     }
 
+
+# =========================================================
+# 9. STANDALONE EXECUTION
+# =========================================================
 
 if __name__ == "__main__":
 
@@ -262,7 +406,11 @@ if __name__ == "__main__":
     print(output["cleaning_report"])
 
     print("\n========== CLUSTER EVALUATION ==========")
-    print(output["evaluation"].round(4).to_string(index=False))
+    print(
+        output["evaluation"]
+        .round(4)
+        .to_string(index=False)
+    )
 
     print("\n========== FINAL MODEL METRICS ==========")
     print(output["metrics"])
